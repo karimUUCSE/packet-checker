@@ -4,220 +4,498 @@ import org.pcap4j.core.PcapDumper;
 import org.pcap4j.core.PcapHandle;
 import org.pcap4j.core.PcapNetworkInterface;
 import org.pcap4j.core.Pcaps;
-import org.pcap4j.packet.DnsPacket;
-import org.pcap4j.packet.IpPacket;
-import org.pcap4j.packet.Packet;
-import org.pcap4j.packet.TcpPacket;
-import org.pcap4j.packet.UdpPacket;
+import org.pcap4j.packet.*;
+import org.pcap4j.packet.namednumber.IpNumber;
 
-import java.io.BufferedReader;
 import java.io.File;
-import java.io.InputStreamReader;
 import java.net.InetAddress;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.Scanner;
 
 public class Main {
 
-    private static volatile boolean isRunning = true;
-
     public static void main(String[] args) throws Exception {
-        System.out.println("===========================================================================================");
-        System.out.println("  PACKET SNIFFER AUDIT TOOL | Pcap4J Engine: " + Pcaps.libVersion());
-        System.out.println("===========================================================================================");
 
-        File outputDir = new File("captures/output");
+        System.out.println("=================================================");
+        System.out.println("Network Packet Reader");
+        System.out.println("Pcap Version: " + Pcaps.libVersion());
+        System.out.println("=================================================");
+
         File inputDir = new File("captures/input");
+        File outputDir = new File("captures/output");
 
-        if (!outputDir.exists()) outputDir.mkdirs();
-        if (!inputDir.exists()) inputDir.mkdirs();
+        if (!inputDir.exists()) {
+            inputDir.mkdirs();
+        }
 
-        // Interactive console input check
-        Scanner inputScanner = new Scanner(System.in);
-        System.out.print("Do you want to read an offline PCAP file? (y/n): ");
-        String choice = inputScanner.nextLine().trim().toLowerCase();
+        if (!outputDir.exists()) {
+            outputDir.mkdirs();
+        }
 
-        if (choice.equals("y") || choice.equals("yes")) {
-            runOfflineReader(inputDir);
-        } else {
-            runLiveSniffer(new File(outputDir, "output_capture.pcap").getAbsolutePath());
+        Scanner scanner = new Scanner(System.in);
+
+        System.out.println();
+        System.out.println("1 - Live Capture");
+        System.out.println("2 - Read PCAP File");
+        System.out.print("Choose mode: ");
+
+        String mode = scanner.nextLine().trim();
+
+        PacketProcessor processor = new PacketProcessor();
+
+        PacketReader reader =
+                new PacketReader(processor);
+
+        if ("2".equals(mode)) {
+            reader.readOfflinePcap(inputDir);
+        }
+        else {
+            reader.runLiveCapture(outputDir);
         }
     }
 
-    private static void runLiveSniffer(String savePath) throws Exception {
-        PcapNetworkInterface nif = null;
-        for (PcapNetworkInterface dev : Pcaps.findAllDevs()) {
-            String name = dev.getName().toLowerCase();
-            // Secure selection: Active interfaces only, rejecting loopback footprints
-            if (!dev.getAddresses().isEmpty() && !dev.isLoopBack() && !name.startsWith("lo")) {
-                nif = dev;
-                break;
+    static class PacketReader {
+
+        private final PacketProcessor processor;
+
+        private volatile boolean running = true;
+
+        public PacketReader(PacketProcessor processor) {
+
+            this.processor = processor;
+        }
+
+        public void runLiveCapture(File outputDir)
+                throws Exception {
+
+            PcapNetworkInterface nif = null;
+
+            for (PcapNetworkInterface dev :
+                    Pcaps.findAllDevs()) {
+
+                if (!dev.isLoopBack()
+                        && !dev.getAddresses().isEmpty()) {
+
+                    nif = dev;
+                    break;
+                }
+            }
+
+            if (nif == null) {
+
+                System.out.println(
+                        "No active network interface found."
+                );
+
+                return;
+            }
+
+            System.out.println();
+            System.out.println(
+                    "Using Interface: "
+                            + nif.getName()
+            );
+
+            PcapHandle handle =
+                    nif.openLive(
+                            65536,
+                            PcapNetworkInterface
+                                    .PromiscuousMode
+                                    .PROMISCUOUS,
+                            50
+                    );
+
+            String outputFile =
+                    new File(
+                            outputDir,
+                            "capture-"
+                                    + System.currentTimeMillis()
+                                    + ".pcap"
+                    ).getAbsolutePath();
+
+            PcapDumper dumper =
+                    handle.dumpOpen(outputFile);
+
+            Runtime.getRuntime()
+                    .addShutdownHook(
+                            new Thread(() -> {
+
+                                running = false;
+
+                                try {
+
+                                    dumper.close();
+                                    handle.close();
+
+                                } catch (Exception ignored) {
+                                }
+
+                                System.out.println();
+                                System.out.println(
+                                        "Capture saved to:"
+                                );
+                                System.out.println(
+                                        outputFile
+                                );
+                            })
+                    );
+
+            System.out.println();
+            System.out.println(
+                    "Waiting for packets..."
+            );
+            System.out.println();
+
+            int count = 0;
+
+            while (running) {
+
+                Packet packet =
+                        handle.getNextPacket();
+
+                if (packet == null) {
+                    continue;
+                }
+
+                count++;
+
+                dumper.dump(
+                        packet,
+                        handle.getTimestamp()
+                );
+
+                processor.process(
+                        packet,
+                        count
+                );
             }
         }
 
-        if (nif == null) {
-            System.out.println("[ERROR] Active network interface not found. Ensure Wi-Fi or Ethernet is connected.");
-            return;
-        }
+        public void readOfflinePcap(
+                File inputDir
+        ) throws Exception {
 
-        System.out.println("\n[DEVICE METADATA]");
-        System.out.println("Interface Name : " + nif.getName());
-        if (!nif.getLinkLayerAddresses().isEmpty()) {
-            System.out.println("Hardware MAC   : " + nif.getLinkLayerAddresses().get(0));
-        }
-        System.out.println("-------------------------------------------------------------------------------------------");
+            File[] files =
+                    inputDir.listFiles(
+                            (dir, name) ->
+                                    name.endsWith(".pcap")
+                                            || name.endsWith(".cap")
+                    );
 
-        PcapHandle handle = nif.openLive(65536, PcapNetworkInterface.PromiscuousMode.PROMISCUOUS, 50);
-        PcapDumper dumper = handle.dumpOpen(savePath);
+            if (files == null
+                    || files.length == 0) {
 
-        startLinuxCacheListener();
+                System.out.println();
+                System.out.println(
+                        "No PCAP files found in:"
+                );
+                System.out.println(
+                        inputDir.getAbsolutePath()
+                );
 
-        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-            isRunning = false;
-            try {
-                Thread.sleep(120);
-                System.out.println("\n[SHUTDOWN] PCAP stream sealed cleanly.");
-                dumper.close();
-                handle.close();
-            } catch (Exception e) {
-                System.out.println("Shutdown exception handled: " + e.getMessage());
+                return;
             }
-        }));
 
-        System.out.println("[LIVE MODE] Sniffing active... Saving to: " + savePath);
-        printDashboardHeader();
+            File pcapFile =
+                    files[0];
 
-        int count = 0;
-        while (isRunning) {
-            Packet packet = handle.getNextPacket();
-            if (packet == null) continue;
-            if (!isRunning) break;
+            System.out.println();
+            System.out.println(
+                    "Reading:"
+            );
+            System.out.println(
+                    pcapFile.getAbsolutePath()
+            );
+            System.out.println();
 
-            count++;
-            dumper.dump(packet, handle.getTimestamp());
-            processAndPrintSingleLine(packet, count);
+            PcapHandle handle =
+                    Pcaps.openOffline(
+                            pcapFile.getAbsolutePath()
+                    );
+
+            int count = 0;
+
+            while (true) {
+
+                Packet packet =
+                        handle.getNextPacket();
+
+                if (packet == null) {
+                    break;
+                }
+
+                count++;
+
+                processor.process(
+                        packet,
+                        count
+                );
+            }
+
+            handle.close();
+
+            System.out.println();
+            System.out.println(
+                    "Finished."
+            );
+            System.out.println(
+                    "Packets Processed: "
+                            + count
+            );
         }
     }
 
-    private static void startLinuxCacheListener() {
-        Thread cacheThread = new Thread(() -> {
-            try {
-                Process process = new ProcessBuilder("journalctl", "-u", "systemd-resolved.service", "-f", "-n", "0").start();
-                BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()));
-                String line;
+    static class PacketProcessor {
 
-                while (isRunning && (line = reader.readLine()) != null) {
-                    if (line.contains("Using cached zone data") || line.contains("cache-hit")) {
-                        String domain = "Unknown Domain";
-                        if (line.contains("zone data for")) {
-                            domain = line.substring(line.indexOf("zone data for") + 14).trim().split(" ")[0];
+        private final DnsCache dnsCache =
+                new DnsCache();
+
+        public PacketProcessor() {
+
+            printHeader();
+        }
+
+        private void printHeader() {
+
+            System.out.println(
+                    "------------------------------------------------------------------------------------------------------------------------");
+
+            System.out.printf(
+                    "%-8s %-10s %-18s %-18s %-10s %-40s %-15s%n",
+                    "PACKET",
+                    "PROTO",
+                    "SOURCE",
+                    "DESTINATION",
+                    "SIZE",
+                    "INFO",
+                    "PAYLOAD"
+            );
+
+            System.out.println(
+                    "------------------------------------------------------------------------------------------------------------------------");
+        }
+
+        public void process(Packet packet, int count) {
+
+            String protocol = "UNKNOWN";
+            String source = "-";
+            String destination = "-";
+            String info = "";
+            String payloadPreview = "";
+
+            IpPacket ip =
+                    packet.get(IpPacket.class);
+
+            if (ip != null) {
+
+                InetAddress src =
+                        ip.getHeader().getSrcAddr();
+
+                InetAddress dst =
+                        ip.getHeader().getDstAddr();
+
+                source =
+                        src.getHostAddress();
+
+                destination =
+                        dst.getHostAddress();
+
+                DnsPacket dns =
+                        packet.get(DnsPacket.class);
+
+                if (dns != null) {
+
+                    protocol = "DNS";
+
+                    if (!dns.getHeader()
+                            .getQuestions()
+                            .isEmpty()) {
+
+                        String domain =
+                                dns.getHeader()
+                                        .getQuestions()
+                                        .get(0)
+                                        .getQName()
+                                        .getName();
+
+                        if (dns.getHeader().isResponse()) {
+
+                            info =
+                                    "DNS Response: "
+                                            + domain;
+
+                        } else {
+
+                            info =
+                                    "DNS Query: "
+                                            + domain;
+
+                            dnsCache.put(
+                                    destination,
+                                    domain
+                            );
                         }
-                        System.out.printf("[SYSTEM] | OS-CACHE | ---------- | LOCAL RAM MEMORY CACHE               | [HIT] %s\n", domain);
-                        System.out.flush();
                     }
                 }
-                process.destroy();
-            } catch (Exception ignored) {}
-        });
-        cacheThread.setDaemon(true);
-        cacheThread.start();
-    }
 
-    private static void runOfflineReader(File inputDir) throws Exception {
-        File[] pcapFiles = inputDir.listFiles((dir, name) -> name.toLowerCase().endsWith(".pcap"));
+                else {
 
-        if (pcapFiles == null || pcapFiles.length == 0) {
-            System.out.println("\n[ERROR] No .pcap logs discovered inside: " + inputDir.getAbsolutePath());
-            return;
-        }
+                    TcpPacket tcp =
+                            packet.get(TcpPacket.class);
 
-        File fileToRead = pcapFiles[0];
-        System.out.println("\n[READ MODE] Processing: " + fileToRead.getName());
-        printDashboardHeader();
+                    UdpPacket udp =
+                            packet.get(UdpPacket.class);
 
-        PcapHandle handle = Pcaps.openOffline(fileToRead.getAbsolutePath());
+                    IcmpV4CommonPacket icmp =
+                            packet.get(IcmpV4CommonPacket.class);
 
-        int count = 0;
-        while (true) {
-            Packet packet = handle.getNextPacket();
-            if (packet == null) break;
-            count++;
-            processAndPrintSingleLine(packet, count);
-        }
+                    if (tcp != null) {
 
-        handle.close();
-        System.out.println("-------------------------------------------------------------------------------------------");
-        System.out.println("[READ MODE] Processing finalized. Absolute Packet Count: " + count);
-    }
+                        protocol = "TCP";
 
-    private static void printDashboardHeader() {
-        System.out.println("-------------------------------------------------------------------------------------------");
-        System.out.printf("%-8s | %-8s | %-10s | %-38s | %s\n", "INDEX", "PROTO", "SIZE", "ROUTING (SRC -> DST)", "INFO SUMMARY");
-        System.out.println("-------------------------------------------------------------------------------------------");
-    }
+                        info =
+                                "Port "
+                                        + tcp.getHeader()
+                                        .getSrcPort()
+                                        .valueAsInt()
+                                        + " -> "
+                                        + tcp.getHeader()
+                                        .getDstPort()
+                                        .valueAsInt();
 
-    private static void processAndPrintSingleLine(Packet packet, int count) throws Exception {
-        String protoStr = "UNKNOWN";
-        String routingStr = "Local / Link-Layer Data";
-        String infoSummary = "Raw Frame Payload";
+                        if (tcp.getPayload() != null) {
 
-        IpPacket ip = packet.get(IpPacket.class);
-        TcpPacket tcp = packet.get(TcpPacket.class);
-        UdpPacket udp = packet.get(UdpPacket.class);
+                            payloadPreview =
+                                    PayloadUtil.extractPreview(
+                                            tcp.getPayload()
+                                                    .getRawData()
+                                    );
+                        }
+                    }
 
-        if (ip != null) {
-            protoStr = translateProtocol(ip.getHeader().getProtocol().toString());
+                    else if (udp != null) {
 
-            InetAddress src = ip.getHeader().getSrcAddr();
-            InetAddress dst = ip.getHeader().getDstAddr();
-            routingStr = String.format("%-15s -> %-15s", src.getHostAddress(), dst.getHostAddress());
+                        protocol = "UDP";
 
-            if (tcp != null) {
-                infoSummary = String.format("Ports: %d->%d [SEQ:%d]", tcp.getHeader().getSrcPort().valueAsInt(), tcp.getHeader().getDstPort().valueAsInt(), tcp.getHeader().getSequenceNumber());
-            } else if (udp != null) {
-                infoSummary = String.format("Ports: %d->%d", udp.getHeader().getSrcPort().valueAsInt(), udp.getHeader().getDstPort().valueAsInt());
+                        info =
+                                "Port "
+                                        + udp.getHeader()
+                                        .getSrcPort()
+                                        .valueAsInt()
+                                        + " -> "
+                                        + udp.getHeader()
+                                        .getDstPort()
+                                        .valueAsInt();
+
+                        if (udp.getPayload() != null) {
+
+                            payloadPreview =
+                                    PayloadUtil.extractPreview(
+                                            udp.getPayload()
+                                                    .getRawData()
+                                    );
+                        }
+                    }
+
+                    else if (icmp != null) {
+
+                        protocol = "ICMP";
+
+                        String host = null;
+
+                        if (dnsCache.contains(destination)) {
+
+                            host =
+                                    dnsCache.get(
+                                            destination
+                                    );
+                        }
+
+                        if (host != null) {
+
+                            info =
+                                    "Ping "
+                                            + host;
+
+                        } else {
+
+                            info =
+                                    "ICMP Packet";
+                        }
+                    }
+
+                    else {
+
+                        IpNumber ipNumber =
+                                ip.getHeader()
+                                        .getProtocol();
+
+                        protocol =
+                                ipNumber.toString();
+                    }
+                }
             }
 
-            DnsPacket dns = packet.get(DnsPacket.class);
-            if (dns != null && !dns.getHeader().getQuestions().isEmpty()) {
-                protoStr = "DNS";
-                String domain = dns.getHeader().getQuestions().get(0).getQName().getName();
-                infoSummary = (dns.getHeader().isResponse() ? "[RES] " : "[REQ] ") + domain;
-            }
+            System.out.printf(
+                    "%-8d %-10s %-18s %-18s %-10d %-40s %-15s%n",
+                    count,
+                    protocol,
+                    source,
+                    destination,
+                    packet.length(),
+                    info,
+                    payloadPreview
+            );
         }
-
-        if (tcp != null && tcp.getPayload() != null) {
-            byte[] applicationData = tcp.getPayload().getRawData();
-            String cleanAscii = extractReadableAscii(applicationData);
-            if (!cleanAscii.isEmpty()) {
-                infoSummary += " | Data snippet: " + cleanAscii;
-            }
-        }
-
-        System.out.printf("[%6d] | %-8s | %4d bytes | %-38s | %s\n",
-                count, protoStr, packet.length(), routingStr, infoSummary);
-        System.out.flush();
     }
 
-    private static String translateProtocol(String rawProto) {
-        String clean = rawProto.split(" ")[0].toUpperCase();
-        if (clean.equals("6")) return "TCP";
-        if (clean.equals("17")) return "UDP";
-        if (clean.equals("58")) return "ICMPv6";
-        if (clean.equals("1")) return "ICMP";
-        return clean;
+    static class DnsCache {
+
+        private final Map<String, String> cache =
+                new HashMap<>();
+
+        public void put(String ip, String domain) {
+            cache.put(ip, domain);
+        }
+
+        public String get(String ip) {
+            return cache.get(ip);
+        }
+
+        public boolean contains(String ip) {
+            return cache.containsKey(ip);
+        }
     }
 
-    private static String extractReadableAscii(byte[] data) {
-        StringBuilder sb = new StringBuilder();
-        for (byte b : data) {
-            if (b >= 32 && b <= 126) {
-                sb.append((char) b);
+    static class PayloadUtil {
+
+        public static String extractPreview(byte[] data) {
+
+            if (data == null || data.length == 0) {
+                return "";
             }
+
+            StringBuilder sb = new StringBuilder();
+
+            for (byte b : data) {
+
+                if (b >= 32 && b <= 126) {
+                    sb.append((char) b);
+                }
+            }
+
+            String text = sb.toString().trim();
+
+            if (text.isEmpty()) {
+                return "";
+            }
+
+            if (text.length() <= 10) {
+                return text;
+            }
+
+            return text;
         }
-        String text = sb.toString().trim();
-        if (text.length() > 15) {
-            return text.substring(0, 5) + "..." + text.substring(text.length() - 5);
-        }
-        return text;
     }
 }
